@@ -1,5 +1,5 @@
 import sys
-
+import itertools
 
 def choose_one(choices, prompt):
     for idx, choice in enumerate(choices):
@@ -19,3 +19,5 @@ def choose_one(choices, prompt):
 def error_exit(msg, status=1):
     sys.stderr.write('Error: %s\n' % msg)
     sys.exit(status)
+
+

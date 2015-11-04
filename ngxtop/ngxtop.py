@@ -65,6 +65,8 @@ import sqlite3
 import time
 import sys
 import signal
+import json
+
 
 try:
     import urlparse
@@ -77,34 +79,49 @@ import tabulate
 from .config_parser import detect_log_config, detect_config_path, extract_variables, build_pattern
 from .utils import error_exit
 
+# my cpp extension
+import ngxtop_cpp
+
+
+def count_by(d, keys):
+    _keys = filter(keys, d.keys())
+    return sum(d[k] for k in _keys)
+
+Summary = ('summary',
+    {
+        'y': ['', ''],
+        'x': [
+            ['count', lambda y, h, v: count_by(v['count'], lambda _k: True)],
+            ['bytes_sent', lambda y, h, v: count_by(v['bytes_sent'], lambda _k: True)],
+            [lambda x: set([int(i[0])/100 for i in x['count']]),
+                lambda y, h, v: count_by(v['count'], lambda _k: int(_k[0])/100 == int(h))]
+        ]
+    },
+    ['status', ],
+    ['bytes_sent']
+
+)
+
+Detailed = (
+    'Detailed:',     # title_name
+    {
+        'y': ['geoip_city', lambda v, h: set([i[0] for i in v['count']])],
+        'x': [
+            ['count', lambda y, h, v: count_by(v['count'], lambda _k: _k[0] == y)],
+            ['bytes_sent', lambda y, h, v: count_by(v['bytes_sent'], lambda _k: _k[0] == y)],
+            [lambda x: set([int(i[1])/100 for i in x['count']]),
+                lambda y, h, v: count_by(v['count'], lambda _k: int(_k[1])/100 == int(h) and _k[0] == y )]
+        ]
+    },
+
+    ['geoip_city', 'status'],  # group by
+    ['bytes_sent']  # sum_by
+
+)
 
 DEFAULT_QUERIES = [
-    ('Summary:',
-     '''SELECT
-       count(1)                                    AS count,
-       avg(bytes_sent)                             AS avg_bytes_sent,
-       count(CASE WHEN status_type = 2 THEN 1 END) AS '2xx',
-       count(CASE WHEN status_type = 3 THEN 1 END) AS '3xx',
-       count(CASE WHEN status_type = 4 THEN 1 END) AS '4xx',
-       count(CASE WHEN status_type = 5 THEN 1 END) AS '5xx'
-     FROM log
-     ORDER BY %(--order-by)s DESC
-     LIMIT %(--limit)s'''),
-
-    ('Detailed:',
-     '''SELECT
-       %(--group-by)s,
-       count(1)                                    AS count,
-       avg(bytes_sent)                             AS avg_bytes_sent,
-       count(CASE WHEN status_type = 2 THEN 1 END) AS '2xx',
-       count(CASE WHEN status_type = 3 THEN 1 END) AS '3xx',
-       count(CASE WHEN status_type = 4 THEN 1 END) AS '4xx',
-       count(CASE WHEN status_type = 5 THEN 1 END) AS '5xx'
-     FROM log
-     GROUP BY %(--group-by)s
-     HAVING %(--having)s
-     ORDER BY %(--order-by)s DESC
-     LIMIT %(--limit)s''')
+    Summary,
+    Detailed
 ]
 
 DEFAULT_FIELDS = set(['status_type', 'bytes_sent'])
@@ -184,7 +201,7 @@ def to_float(value):
 
 def parse_log(lines, pattern):
     matches = (pattern.match(l) for l in lines)
-    records = (m.groupdict() for m in matches if m is not None)
+    records = (m.groupdict() for m in matches if m is not None)  # construct : [{key: val}, ...]
     records = map_field('status', to_int, records)
     records = add_field('status_type', parse_status_type, records)
     records = add_field('bytes_sent', lambda r: r['body_bytes_sent'], records)
@@ -198,61 +215,115 @@ def parse_log(lines, pattern):
 # Records and statistic processor
 # =================================
 class SQLProcessor(object):
-    def __init__(self, report_queries, fields, index_fields=None):
-        self.begin = False
-        self.report_queries = report_queries
-        self.index_fields = index_fields if index_fields is not None else []
-        self.column_list = ','.join(fields)
-        self.holder_list = ','.join(':%s' % var for var in fields)
-        self.conn = sqlite3.connect(':memory:')
-        self.init_db()
+    def __init__(self):
+        pass
+        # self.report_queries = report_queries
+        # self.index_fields = index_fields if index_fields is not None else []
+        # self.column_list = ','.join(fields)
+        # self.holder_list = ','.join(':%s' % var for var in fields)
+        # self.conn = sqlite3.connect(':memory:')
+        # self.init_db()
 
-    def process(self, records):
-        self.begin = time.time()
-        insert = 'insert into log (%s) values (%s)' % (self.column_list, self.holder_list)
-        logging.info('sqlite insert: %s', insert)
-        with closing(self.conn.cursor()) as cursor:
-            for r in records:
-                cursor.execute(insert, r)
+    # def process(self, records):
+    #     self.begin = time.time()
+    #     insert = 'insert into log (%s) values (%s)' % (self.column_list, self.holder_list)
+    #     logging.info('sqlite insert: %s', insert)
+    #     with closing(self.conn.cursor()) as cursor:
+    #         for r in records:
+    #             cursor.execute(insert, r)
 
     def report(self):
-        if not self.begin:
+        records = ngxtop_cpp.get_records()
+        if not records:
             return ''
-        count = self.count()
-        duration = time.time() - self.begin
+
+        count = 0
+        duration = 1
         status = 'running for %.0f seconds, %d records processed: %.2f req/sec'
         output = [status % (duration, count, count / duration)]
-        with closing(self.conn.cursor()) as cursor:
-            for query in self.report_queries:
-                if isinstance(query, tuple):
-                    label, query = query
+        # with closing(self.conn.cursor()) as cursor:
+        #     for query in self.report_queries:
+        #         if isinstance(query, tuple):
+        #             label, query = query
+        #         else:
+        #             label = ''
+        #         cursor.execute(query)
+        #         columns = (d[0] for d in cursor.description)
+        #         result = tabulate.tabulate(cursor.fetchall(), headers=columns, tablefmt='orgtbl', floatfmt='.3f')
+        #         output.append('%s\n%s' % (label, result))
+
+        for query in DEFAULT_QUERIES:
+            table_name = query[0]
+            table_data = records[table_name]
+            y_axis = query[1]['y']
+            x_axis_list = query[1]['x']
+            table_headers = []
+            x_headers = []
+            table = []
+
+            table_headers.append(y_axis[0])
+            if callable(y_axis[1]):
+                y_headers = y_axis[1](table_data, y_axis[0])
+            else:
+                y_headers = [y_axis[1]]
+
+            for x in x_axis_list:
+                if callable(x[0]):
+                    x[0] = x[0](table_data)
+                if isinstance(x[0], (list, tuple, set)):
+                    x_headers.extend([(__x, x[1]) for __x in x[0]])
+                    table_headers.extend(x[0])
                 else:
-                    label = ''
-                cursor.execute(query)
-                columns = (d[0] for d in cursor.description)
-                result = tabulate.tabulate(cursor.fetchall(), headers=columns, tablefmt='orgtbl', floatfmt='.3f')
-                output.append('%s\n%s' % (label, result))
+                    x_headers.append((x[0], x[1]))
+                    table_headers.append(x[0])
+
+            for y in y_headers:
+                lines = [y]
+                for x0, x1 in x_headers:
+                    lines.append(x1(y, x0, table_data))
+                table.append(lines)
+            result = tabulate.tabulate(table, headers=table_headers, tablefmt='orgtbl', floatfmt='.3f')
+            output.append('%s\n%s' % (table_name, result))
+
+            # expansion x axis
+
         return '\n\n'.join(output)
 
-    def init_db(self):
-        create_table = 'create table log (%s)' % self.column_list
-        with closing(self.conn.cursor()) as cursor:
-            logging.info('sqlite init: %s', create_table)
-            cursor.execute(create_table)
-            for idx, field in enumerate(self.index_fields):
-                sql = 'create index log_idx%d on log (%s)' % (idx, field)
-                logging.info('sqlite init: %s', sql)
-                cursor.execute(sql)
+    # def init_db(self):
+    #     create_table = 'create table log (%s)' % self.column_list
+    #     with closing(self.conn.cursor()) as cursor:
+    #         logging.info('sqlite init: %s', create_table)
+    #         cursor.execute(create_table)
+    #         for idx, field in enumerate(self.index_fields):
+    #             sql = 'create index log_idx%d on log (%s)' % (idx, field)
+    #             logging.info('sqlite init: %s', sql)
+    #             cursor.execute(sql)
 
-    def count(self):
-        with closing(self.conn.cursor()) as cursor:
-            cursor.execute('select count(1) from log')
-            return cursor.fetchone()[0]
+    # def count(self):
+    #     with closing(self.conn.cursor()) as cursor:
+    #         cursor.execute('select count(1) from log')
+    #         return cursor.fetchone()[0]
 
 
 # ===============
 # Log processing
 # ===============
+def new_process_parse(access_log, arguments, pattern_str, rules):
+    arguments_str = json.dumps(arguments)
+    print(rules)
+    __access_log_name = 'test.log'
+    __args = '{"--no-follow": true, "--pre-filter" : ""}'
+    __pattern_str = '$remote_addr - $remote_user [$time_local] ' \
+                  '"$request" $status $body_bytes_sent "$http_referer" ' \
+                  '"$http_user_agent" "$http_x_forwarded_for" $request_time ' \
+                  '"$geoip_city" "$geoip_region_name" "$geoip_country_name" ' \
+                  '"$upstream_addr" $upstream_response_time'
+    __group_sum_methods = {
+        "summary": (['status', 'uri'], ['bytes_sent'])
+    }
+    ngxtop_cpp.run(access_log, arguments_str, __pattern_str, rules)
+
+
 def process_log(lines, pattern, processor, arguments):
     pre_filer_exp = arguments['--pre-filter']
     if pre_filer_exp:
@@ -260,53 +331,54 @@ def process_log(lines, pattern, processor, arguments):
 
     records = parse_log(lines, pattern)
 
-    filter_exp = arguments['--filter']
-    if filter_exp:
-        records = (r for r in records if eval(filter_exp, {}, r))
+    # filter_exp = arguments['--filter']
+    # if filter_exp:
+    #     records = (r for r in records if eval(filter_exp, {}, r))
 
-    processor.process(records)
-    print(processor.report())  # this will only run when start in --no-follow mode
+    # processor.process(records)
+    # print(processor.report())  # this will only run when start in --no-follow mode
 
 
 def build_processor(arguments):
-    fields = arguments['<var>']
-    if arguments['print']:
-        label = ', '.join(fields) + ':'
-        selections = ', '.join(fields)
-        query = 'select %s from log group by %s' % (selections, selections)
-        report_queries = [(label, query)]
-    elif arguments['top']:
-        limit = int(arguments['--limit'])
-        report_queries = []
-        for var in fields:
-            label = 'top %s' % var
-            query = 'select %s, count(1) as count from log group by %s order by count desc limit %d' % (var, var, limit)
-            report_queries.append((label, query))
-    elif arguments['avg']:
-        label = 'average %s' % fields
-        selections = ', '.join('avg(%s)' % var for var in fields)
-        query = 'select %s from log' % selections
-        report_queries = [(label, query)]
-    elif arguments['sum']:
-        label = 'sum %s' % fields
-        selections = ', '.join('sum(%s)' % var for var in fields)
-        query = 'select %s from log' % selections
-        report_queries = [(label, query)]
-    elif arguments['query']:
-        report_queries = arguments['<query>']
-        fields = arguments['<fields>']
-    else:
-        report_queries = [(name, query % arguments) for name, query in DEFAULT_QUERIES]
-        fields = DEFAULT_FIELDS.union(set([arguments['--group-by']]))
+    # fields = arguments['<var>']
+    # if arguments['print']:
+    #     label = ', '.join(fields) + ':'
+    #     selections = ', '.join(fields)
+    #     query = 'select %s from log group by %s' % (selections, selections)
+    #     report_queries = [(label, query)]
+    # elif arguments['top']:
+    #     limit = int(arguments['--limit'])
+    #     report_queries = []
+    #     for var in fields:
+    #         label = 'top %s' % var
+    #         query = 'select %s, count(1) as count from log group by %s order by count desc limit %d' % (var, var, limit)
+    #         report_queries.append((label, query))
+    # elif arguments['avg']:
+    #     label = 'average %s' % fields
+    #     selections = ', '.join('avg(%s)' % var for var in fields)
+    #     query = 'select %s from log' % selections
+    #     report_queries = [(label, query)]
+    # elif arguments['sum']:
+    #     label = 'sum %s' % fields
+    #     selections = ', '.join('sum(%s)' % var for var in fields)
+    #     query = 'select %s from log' % selections
+    #     report_queries = [(label, query)]
+    # elif arguments['query']:
+    #     report_queries = arguments['<query>']
+    #     fields = arguments['<fields>']
+    # else:
+    #     report_queries = [(name, query % arguments) for name, query in DEFAULT_QUERIES]
+    #     fields = DEFAULT_FIELDS.union(set([arguments['--group-by']]))
+    #
+    # for label, query in report_queries:
+    #     logging.info('query for "%s":\n %s', label, query)
+    #
+    # processor_fields = []
+    # for field in fields:
+    #     processor_fields.extend(field.split(','))
 
-    for label, query in report_queries:
-        logging.info('query for "%s":\n %s', label, query)
-
-    processor_fields = []
-    for field in fields:
-        processor_fields.extend(field.split(','))
-
-    processor = SQLProcessor(report_queries, processor_fields)
+    # processor = SQLProcessor(report_queries, processor_fields)
+    processor = SQLProcessor()
     return processor
 
 
@@ -322,8 +394,8 @@ def build_source(access_log, arguments):
 
 
 def setup_reporter(processor, arguments):
-    if arguments['--no-follow']:
-        return
+    # if arguments['--no-follow']:
+    #     return
 
     scr = curses.initscr()
     atexit.register(curses.endwin)
@@ -363,11 +435,14 @@ def process(arguments):
         print('available variables:\n ', ', '.join(sorted(extract_variables(log_format))))
         return
 
-    source = build_source(access_log, arguments)
-    pattern = build_pattern(log_format)
+    # source = build_source(access_log, arguments)  # repl
+    # pattern = build_pattern(log_format)  # repl
     processor = build_processor(arguments)
-    setup_reporter(processor, arguments)
-    process_log(source, pattern, processor, arguments)
+    # setup_reporter(processor, arguments)
+    rules = dict([(_d[0], (_d[2], _d[3])) for _d in DEFAULT_QUERIES])
+    new_process_parse(access_log, arguments, log_format, rules)
+    print(processor.report())
+    # process_log(source, pattern, processor, arguments) #repl
 
 
 def main():
